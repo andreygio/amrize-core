@@ -7,7 +7,7 @@ terraform {
 }
 
 dependency "networking" {
-  config_path = "../networking"
+  config_path = "${get_original_terragrunt_dir()}/../networking"
 
   mock_outputs_allowed_terraform_commands = ["validate", "plan"]
   mock_outputs = {
