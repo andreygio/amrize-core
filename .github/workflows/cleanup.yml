@@ -8,7 +8,7 @@ on:
         required: true
         type: choice
         options: [both, aws, gcp]
-        default: both
+        default: aws
       env:
         description: 'Target environment'
         required: true

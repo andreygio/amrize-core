@@ -2,7 +2,7 @@ name: CD
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   workflow_dispatch:
     inputs:
       provider:
@@ -10,7 +10,7 @@ on:
         required: false
         type: choice
         options: [both, aws, gcp]
-        default: both
+        default: aws
       env:
         description: 'Target environment'
         required: false
@@ -33,7 +33,7 @@ jobs:
       - name: Resolve inputs
         id: resolve
         run: |
-          PROVIDER="${{ inputs.provider || 'both' }}"
+          PROVIDER="${{ inputs.provider || 'aws' }}"
           ENV="${{ inputs.env || 'dev' }}"
 
           if [ "$PROVIDER" = "both" ]; then
