@@ -2,34 +2,45 @@
 
 ## Overview
 
-This repository provisions and manages multi-cloud infrastructure across **AWS** and **GCP** using **Terragrunt** and **Terraform**. It is structured around three environments (`dev`, `stage`, `prod`) and two infrastructure domains (`networking`, `kubernetes`), deployed on both providers.
+This repository provisions and manages multi-cloud infrastructure across **AWS** and **GCP** using **Terragrunt** and **Terraform**. It is structured around three environments (`dev`, `stage`, `prod`) and four infrastructure domains (`networking`, `kubernetes`, `alb-controller`, `argocd`), deployed on both providers.
+
+Application deployments are handled via **ArgoCD** using the **ApplicationSet** pattern. A separate GitOps config repository ([amrize-argocd-deployments](https://github.com/andreygio/amrize-argocd-deployments)) acts as the registry of all apps — adding a new app requires only a PR to that repo, with no changes to this infrastructure repository.
 
 ### Architectural Summary
 
 ```
 amrize-core/
-├── aws/                        # AWS provider root
-│   ├── provider.hcl            # S3 remote state + AWS inputs
+├── aws/                              # AWS provider root
+│   ├── provider.hcl                  # S3 remote state + AWS inputs
 │   ├── dev | stage | prod/
-│   │   ├── env.hcl             # Account ID, region
-│   │   ├── networking/         # VPC, subnets, NAT, route tables
-│   │   └── kubernetes/         # EKS cluster + managed node group
-├── gcp/                        # GCP provider root
-│   ├── provider.hcl            # GCS remote state + GCP inputs
+│   │   ├── env.hcl                   # Account ID, region
+│   │   ├── networking/               # VPC, subnets, NAT, route tables
+│   │   ├── kubernetes/               # EKS cluster + managed node group + OIDC provider
+│   │   ├── alb-controller/           # AWS Load Balancer Controller (IRSA + Helm)
+│   │   └── argocd/                   # ArgoCD + ApplicationSet (Helm)
+├── gcp/                              # GCP provider root
+│   ├── provider.hcl                  # GCS remote state + GCP inputs
 │   ├── dev | stage | prod/
-│   │   ├── env.hcl             # Project ID, region, state bucket
-│   │   ├── networking/         # VPC, subnet, Cloud NAT
-│   │   └── kubernetes/         # GKE cluster + node pool
+│   │   ├── env.hcl                   # Project ID, region, state bucket
+│   │   ├── networking/               # VPC, subnet, Cloud NAT
+│   │   ├── kubernetes/               # GKE cluster + node pool
+│   │   └── argocd/                   # ArgoCD + ApplicationSet (Helm)
 ├── modules/
-│   ├── aws/{networking,kubernetes}/   # Reusable Terraform modules
-│   └── gcp/{networking,kubernetes}/
+│   ├── aws/{networking,kubernetes,alb-controller,argocd}/
+│   └── gcp/{networking,kubernetes,argocd}/
 ├── _envcommon/
-│   ├── aws/{networking,kubernetes}.hcl  # Shared module source + defaults
-│   └── gcp/{networking,kubernetes}.hcl  # Dependency wiring (networking → kubernetes)
+│   ├── aws/{networking,kubernetes,alb-controller,argocd}.hcl
+│   └── gcp/{networking,kubernetes,argocd}.hcl
 └── .github/workflows/
-    ├── ci.yml        # Validate + plan on pull requests
+    ├── ci.yml        # Validate + plan on pull requests (dev only)
     ├── cd.yml        # Apply on merge to main
     └── cleanup.yml   # Destroy with explicit confirmation guard
+```
+
+**Dependency chain per environment:**
+```
+AWS:  networking → kubernetes → alb-controller → argocd
+GCP:  networking → kubernetes → argocd
 ```
 
 **Key properties:**
@@ -37,6 +48,15 @@ amrize-core/
 - **Separate remote backends** — AWS uses S3 + DynamoDB locking; GCP uses GCS
 - **Layered includes** — each module merges root → provider → envcommon → environment overrides
 - **OIDC authentication** — no long-lived credentials; GitHub Actions assumes scoped IAM roles and GCP Workload Identities
+- **GitOps app delivery** — ArgoCD ApplicationSet watches the gitops config repo; adding a new app requires no Terraform changes
+
+### Three-repo model
+
+```
+amrize-core (this repo)               → provisions infrastructure + ArgoCD + ApplicationSet
+amrize-argocd-deployments (gitops)    → parameter files that register which apps run where
+hello-platform, future-app (app repos) → source code + Helm charts consumed by ArgoCD
+```
 
 ---
 
@@ -48,7 +68,7 @@ amrize-core/
 |---|---|
 | Terraform | >= 1.9.0 |
 | Terragrunt | >= 0.67.0 |
-| Docker | any recent |
+| Helm | >= 3.x |
 | AWS CLI | >= 2.x |
 | gcloud CLI | >= 450.x |
 
@@ -61,6 +81,16 @@ These must exist before the first `terragrunt init`.
 aws s3api create-bucket \
   --bucket terraform-state-<ACCOUNT_ID>-us-east-1 \
   --region us-east-1
+
+# Enable versioning and encryption on the bucket (required by Terragrunt checks)
+aws s3api put-bucket-versioning \
+  --bucket terraform-state-<ACCOUNT_ID>-us-east-1 \
+  --versioning-configuration Status=Enabled
+
+aws s3api put-bucket-encryption \
+  --bucket terraform-state-<ACCOUNT_ID>-us-east-1 \
+  --server-side-encryption-configuration \
+  '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
 
 aws dynamodb create-table \
   --table-name terraform-locks-dev \
@@ -91,6 +121,16 @@ aws iam create-open-id-connect-provider \
   --client-id-list sts.amazonaws.com
 ```
 
+Each role's policy must include the following S3 permissions on the state bucket (required by Terragrunt's bucket validation checks on every `init`):
+
+```
+s3:GetObject, s3:PutObject, s3:DeleteObject, s3:ListBucket,
+s3:GetBucketVersioning, s3:GetEncryptionConfiguration,
+s3:GetBucketPolicy, s3:GetBucketPublicAccessBlock
+```
+
+Use the `${aws:AccountId}` IAM policy variable in all resource ARNs so the same policy document works across all accounts without modification.
+
 **GCP** — create a Workload Identity Pool and Provider, then bind a service account per environment. See [GCP Workload Identity Federation docs](https://cloud.google.com/iam/docs/workload-identity-federation-with-deployment-pipelines).
 
 ### 3. Configure GitHub Environments
@@ -119,20 +159,48 @@ gcp/dev/env.hcl   → gcp_project_id, gcp_region, gcp_state_bucket
 
 Repeat for `stage` and `prod`.
 
-### 5. Deployment
+### 5. Set up the GitOps config repository
+
+The ArgoCD ApplicationSet watches `https://github.com/andreygio/amrize-argocd-deployments` for parameter files. Structure the repo as follows:
+
+```
+amrize-argocd-deployments/
+├── dev/
+│   └── hello-platform.yaml
+├── stage/
+│   └── hello-platform.yaml
+└── prod/
+    └── hello-platform.yaml
+```
+
+Each file is a flat key-value parameter source (not an ArgoCD Application manifest):
+
+```yaml
+# dev/hello-platform.yaml
+appName: hello-platform
+repoURL: https://github.com/org/hello-platform
+targetRevision: main
+chartPath: helm
+valuesFile: values-dev.yaml
+namespace: hello-platform
+```
+
+The ApplicationSet template (defined in Terraform) combines these parameters to generate one ArgoCD `Application` per file found. Each cluster's ArgoCD only reads its own environment's directory (`dev/*.yaml`, `stage/*.yaml`, or `prod/*.yaml`).
+
+### 6. Deployment
 
 ```bash
 # Plan a single module
 cd aws/dev/networking && terragrunt plan
 
-# Apply a full environment
+# Apply a full environment (respects dependency order automatically)
 cd aws/dev && terragrunt run-all apply
 
 # Apply all environments for one provider
 cd aws && terragrunt run-all apply
 ```
 
-The CI pipeline runs validate + plan automatically on every PR. The CD pipeline applies to the target environment on merge to `main`. Provider and environment are selectable via `workflow_dispatch`.
+The CI pipeline runs validate + plan on dev automatically on every PR. The CD pipeline applies to the target environment on merge to `main`. Provider and environment are selectable via `workflow_dispatch`.
 
 ### Cleanup
 
@@ -156,7 +224,7 @@ AWS modules use **S3 + DynamoDB**; GCP modules use **GCS**. A single S3 backend 
 
 - Giving GCP pipelines an AWS key solely for state access adds unnecessary cross-cloud credential exposure.
 - GCS state access uses GCP Workload Identity natively, improving the audit trail separation.
-- `remote_state` is used for AWS (enables auto-creation of the S3 bucket and DynamoDB table on `init`). GCP uses `remote_state` too but the GCS bucket must be pre-created.
+- `remote_state` is used for both (enables Terragrunt bucket validation checks on `init`). The GCS bucket must be pre-created; the S3 bucket can be auto-created by Terragrunt.
 
 ### OIDC over static credentials
 
@@ -175,11 +243,29 @@ All three GitHub Actions roles authenticate via OIDC/Workload Identity Federatio
 
 ### `_envcommon` pattern
 
-Common module configuration (Terraform source, default inputs, `dependency` wiring) lives once in `_envcommon/`. Per-environment files only override what differs (CIDR ranges, node sizes, HA settings). This avoids duplication across 12 module directories while keeping each leaf file small and readable.
+Common module configuration (Terraform source, default inputs, `dependency` wiring) lives once in `_envcommon/`. Per-environment files only override what differs (CIDR ranges, node sizes, HA settings). This avoids duplication across module directories while keeping each leaf file small and readable.
 
 ### IAM policy variables (`${aws:AccountId}`)
 
 IAM policies use the `${aws:AccountId}` policy variable in resource ARNs rather than hardcoded account IDs. The same policy document is deployed to all three accounts unchanged, and AWS resolves the variable to the correct account at evaluation time.
+
+### Cluster endpoint via data source
+
+The ArgoCD and ALB Controller modules fetch the cluster endpoint and CA certificate directly via `data "aws_eks_cluster"` / `data "google_container_cluster"` rather than accepting them as Terraform variables. This avoids routing sensitive values through the Terragrunt dependency chain and keeps the `_envcommon` inputs to non-sensitive data (cluster name only).
+
+### ApplicationSet with Git file generator
+
+ArgoCD uses an **ApplicationSet** (not App of Apps) to manage application deployments. This choice was made because:
+
+- All apps follow the same pattern (Helm charts with per-env values files) — a single template enforces consistency across every app
+- Adding a new app requires only a PR to the GitOps config repo — no Terraform changes
+- The platform team controls sync policy, retry behaviour, and destination centrally in the template; app teams only supply the four or five parameters that differ per app
+
+Each ArgoCD instance (one per cluster) watches only its own environment's directory in the config repo (`dev/*.yaml`, `stage/*.yaml`, or `prod/*.yaml`), so clusters are fully isolated from each other's application manifests.
+
+### In-cluster deployment (`kubernetes.default.svc`)
+
+The ApplicationSet template uses `destination.server: https://kubernetes.default.svc` — the Kubernetes API server's internal DNS name — which always resolves to the cluster ArgoCD is running in. Since each cluster has its own ArgoCD instance, no cross-cluster credential management or cluster registration is required.
 
 ### Reusable platform capabilities
 
@@ -192,6 +278,7 @@ The following components are strong candidates for standardisation as shared pla
 | GCS state bucket | Manual pre-creation | `platform/gcp-terraform-backend` module |
 | GitHub Environment secrets | Manual configuration | Automated via GitHub Terraform provider |
 | `_envcommon` defaults | Per-repo | Shared registry module with org defaults |
+| ArgoCD + ApplicationSet | Per-repo Helm release | Shared platform module with org-standard sync policy |
 
 ---
 
@@ -225,3 +312,18 @@ In `dev`, `enable_private_endpoint = false` for easier access. A production hard
 
 **`master_ipv4_cidr_block` per environment**
 The GKE master CIDR is currently the same default (`172.16.0.0/28`) across all environments. In a real deployment each environment should use a non-overlapping range, configured explicitly in `env.hcl` rather than relying on the module default.
+
+**ArgoCD SSO**
+ArgoCD is deployed without SSO. In production it should be integrated with an identity provider (Okta, Google, GitHub) so access is controlled by the organisation's existing IAM rather than ArgoCD-local accounts.
+
+**ArgoCD projects**
+All apps are deployed into the `default` ArgoCD project, which has no restrictions. Per-team ArgoCD projects should be created to enforce which source repos, destination namespaces, and cluster resources each team can manage.
+
+**ApplicationSet notification hooks**
+No Slack or PagerDuty notifications are configured for sync failures. ArgoCD's notification controller should be enabled so failed syncs are surfaced immediately without manually checking the ArgoCD UI.
+
+---
+
+## Contributing
+
+Contributors using Claude Code should refer to [CLAUDE.md](CLAUDE.md) for AI tooling setup (required plugins and MCP server configuration).
