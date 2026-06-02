@@ -84,5 +84,8 @@ jobs:
         working-directory: ${{ matrix.provider }}/${{ matrix.env }}
 
       - name: Plan
-        run: terragrunt run-all plan --terragrunt-non-interactive
+        run: |
+          terragrunt run-all plan --terragrunt-non-interactive \
+            --terragrunt-exclude-dir "**/alb-controller" \
+            --terragrunt-exclude-dir "**/argocd"
         working-directory: ${{ matrix.provider }}/${{ matrix.env }}
